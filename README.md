@@ -42,8 +42,10 @@ The topic should usually be wrapped in quotes so your shell passes it as one arg
 Write the report to a file:
 
 ```bash
-uv run python main.py "state of open source LLM inference in 2026" --output reports/inference.md
+uv run python main.py "state of open source LLM inference in 2026" --markdown-output reports/inference.md
 ```
+
+`--output` is also supported as a shorter alias for `--markdown-output`.
 
 Tune the research depth:
 

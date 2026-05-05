@@ -25,7 +25,13 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Search results to read per provider per query. Default: 3.",
     )
-    parser.add_argument("--output", type=Path, help="Optional path to write the Markdown report.")
+    parser.add_argument(
+        "--output",
+        "--markdown-output",
+        dest="output",
+        type=Path,
+        help="Optional path to write the Markdown report.",
+    )
     parser.add_argument("--artifacts", type=Path, help="Optional directory for JSONL research artifacts.")
     parser.add_argument(
         "--providers",
