@@ -37,7 +37,9 @@ Run the agent with `uv` by passing a research topic to `main.py`:
 uv run python main.py "How are AI agents changing software engineering workflows?"
 ```
 
-The topic should usually be wrapped in quotes so your shell passes it as one argument.
+The topic should usually be wrapped in quotes so your shell passes it as one argument. By default,
+the agent now runs a deep report with 3 research passes, 6 queries per pass, 4 results per query,
+up to 48 usable sources, and up to 6 summarized chunks per source.
 
 Write the report to a file:
 
@@ -59,17 +61,17 @@ These options mean:
 - `--queries`: how many search queries Venice should generate per pass.
 - `--results`: how many results to collect per provider for each query.
 
-Choose how detailed the final report should be:
+Choose a different report depth:
 
 ```bash
-uv run python main.py "AI agents in software engineering" --report-style deep
+uv run python main.py "AI agents in software engineering" --report-style standard
 ```
 
 Report styles:
 
-- `brief`: concise briefing with summary, findings, uncertainties, implications, and sources.
-- `standard`: fuller report with method, source landscape, evidence, disagreements, and implications.
-- `deep`: comprehensive report with detailed findings, source quality assessment, open questions, and source-by-source notes.
+- `brief`: concise Perplexity-style briefing with an overview, topical sections, and references.
+- `standard`: fuller Perplexity-style report with a natural technical-blog voice, concrete synthesis, useful tables, uncertainty, and practical takeaways.
+- `deep`: comprehensive long-form report with technical-blog pacing, broad citations, developed sections, concrete comparisons, decision criteria, tables where useful, and limitations or open questions when warranted.
 
 Save auditable research artifacts:
 
@@ -82,9 +84,9 @@ Use multiple source providers and collection controls:
 ```bash
 uv run python main.py "agentic coding research" \
   --providers duckduckgo,arxiv \
-  --max-sources 12 \
+  --max-sources 48 \
   --chunk-chars 3000 \
-  --max-chunks-per-source 4 \
+  --max-chunks-per-source 6 \
   --request-delay 1
 ```
 
@@ -106,15 +108,17 @@ The research process is coordinated by `ResearchAgent` in `research_agent/agent.
 6. **Extract chunk evidence**: Venice summarizes each chunk and returns short supporting quotes where useful. These become chunk-level evidence records.
 7. **Summarize each source**: Venice combines the chunk evidence into a concise source note with a source ID like `[S1]`.
 8. **Generate follow-up queries**: after each pass except the last, Venice reviews the current source notes and proposes new searches to fill gaps, verify claims, and find dissenting evidence.
-9. **Write the report**: Venice receives the source notes and writes a Markdown briefing. The report is instructed to cite factual claims with source IDs and include a `Sources` section.
+9. **Write the report**: Venice receives the source notes and writes a Perplexity-style Markdown report. Deep reports use a staged writer that plans an outline, drafts major sections separately, and runs a final editor pass. Report-writing calls use streaming responses and aggregate the chunks into the final Markdown, which helps avoid long read timeouts. The report is instructed to cite factual claims with footnote-style markers and include a `References` section.
 
-Use `--report-style standard` or `--report-style deep` when you want the final synthesis to spend more tokens on methodology, evidence, uncertainty, and source-by-source analysis.
+Use `--report-style brief` or `--report-style standard` when you want a shorter final synthesis. The
+default `deep` style spends more tokens on long-form topical analysis, evidence, uncertainty, tables,
+practical takeaways, tradeoffs, decision guidance, and broad references.
 
 ## Data collection
 
 The collection layer now keeps richer provenance for each source: canonical URL, final redirected URL, search query, provider, rank, snippet, retrieval time, content type, content hash, extracted chunks, chunk summaries, and supporting quotes. Page fetching uses Venice's `/augment/scrape` endpoint, which returns source content as Markdown before chunking.
 
-When `--artifacts` is set, the agent writes JSONL files for queries, search results, fetch metadata, extracted chunks, chunk summaries, source notes, dedupe decisions, errors, and the final report.
+When `--artifacts` is set, the agent writes JSONL files for queries, search results, fetch metadata, extracted chunks, chunk summaries, source notes, dedupe decisions, errors, staged report outlines and section drafts, editor output, and the final report.
 
 Available providers:
 
@@ -130,5 +134,5 @@ uv run python -m unittest discover -s tests
 ## Notes
 
 - The web search layer is intentionally lightweight for demo purposes.
-- The model is instructed to cite source IDs like `[S1]` and to avoid uncited factual claims.
+- The model is instructed to cite factual claims with Perplexity-like markers such as `[^1]` and to avoid uncited factual claims.
 - The agent continues past individual search or fetch failures because web pages are often blocked, moved, or non-HTML.

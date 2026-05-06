@@ -5,7 +5,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from research_agent import ResearchAgent
+from research_agent import (
+    DEFAULT_ITERATIONS,
+    DEFAULT_MAX_CHUNKS_PER_SOURCE,
+    DEFAULT_MAX_SOURCES,
+    DEFAULT_QUERY_COUNT,
+    DEFAULT_REPORT_STYLE,
+    DEFAULT_RESULTS_PER_QUERY,
+    ResearchAgent,
+)
 from research_agent.artifacts import ArtifactWriter
 from research_agent.venice import VeniceClient, VeniceError
 from research_agent.web import WebSearch
@@ -17,13 +25,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("topic", nargs="+", help="Research topic, wrapped in quotes for best results.")
     parser.add_argument("--model", help="Venice model name. Defaults to VENICE_MODEL or venice-uncensored.")
-    parser.add_argument("--iterations", type=int, default=2, help="Research passes to run. Default: 2.")
-    parser.add_argument("--queries", type=int, default=4, help="Search queries per pass. Default: 4.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=DEFAULT_ITERATIONS,
+        help=f"Research passes to run. Default: {DEFAULT_ITERATIONS}.",
+    )
+    parser.add_argument(
+        "--queries",
+        type=int,
+        default=DEFAULT_QUERY_COUNT,
+        help=f"Search queries per pass. Default: {DEFAULT_QUERY_COUNT}.",
+    )
     parser.add_argument(
         "--results",
         type=int,
-        default=3,
-        help="Search results to read per provider per query. Default: 3.",
+        default=DEFAULT_RESULTS_PER_QUERY,
+        help=f"Search results to read per provider per query. Default: {DEFAULT_RESULTS_PER_QUERY}.",
     )
     parser.add_argument(
         "--output",
@@ -38,7 +56,12 @@ def parse_args() -> argparse.Namespace:
         default="duckduckgo",
         help="Comma-separated source providers. Available: duckduckgo, arxiv. Default: duckduckgo.",
     )
-    parser.add_argument("--max-sources", type=int, help="Optional cap on usable sources collected.")
+    parser.add_argument(
+        "--max-sources",
+        type=int,
+        default=DEFAULT_MAX_SOURCES,
+        help=f"Cap on usable sources collected. Default: {DEFAULT_MAX_SOURCES}.",
+    )
     parser.add_argument(
         "--chunk-chars",
         type=int,
@@ -48,8 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-chunks-per-source",
         type=int,
-        default=4,
-        help="Maximum chunks summarized per source. Default: 4.",
+        default=DEFAULT_MAX_CHUNKS_PER_SOURCE,
+        help=f"Maximum chunks summarized per source. Default: {DEFAULT_MAX_CHUNKS_PER_SOURCE}.",
     )
     parser.add_argument(
         "--request-delay",
@@ -62,8 +85,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--report-style",
         choices=["brief", "standard", "deep"],
-        default="brief",
-        help="Final report depth. Default: brief.",
+        default=DEFAULT_REPORT_STYLE,
+        help=f"Final report depth. Default: {DEFAULT_REPORT_STYLE}.",
     )
     parser.add_argument("--quiet", action="store_true", help="Hide progress messages.")
     return parser.parse_args()

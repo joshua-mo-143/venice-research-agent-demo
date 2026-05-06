@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -9,9 +10,8 @@ import httpx
 
 from .models import ScrapeResult
 
-
 DEFAULT_BASE_URL = "https://api.venice.ai/api/v1"
-DEFAULT_MODEL = "venice-uncensored"
+DEFAULT_MODEL = "openai-gpt-55"
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -38,7 +38,9 @@ class VeniceClient:
     ) -> "VeniceClient":
         api_key = os.getenv("VENICE_API_KEY")
         if not api_key:
-            raise VeniceError("VENICE_API_KEY is required. Add it to your environment or .env file.")
+            raise VeniceError(
+                "VENICE_API_KEY is required. Add it to your environment or .env file."
+            )
 
         return cls(
             api_key=api_key,
@@ -68,6 +70,22 @@ class VeniceClient:
         except (KeyError, IndexError, TypeError) as exc:
             raise VeniceError(f"Unexpected Venice API response: {data}") from exc
 
+    def chat_stream(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1600,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        return self._post_chat_stream("/chat/completions", payload).strip()
+
     def scrape(self, url: str) -> ScrapeResult:
         data = self._post_json("/augment/scrape", {"url": url})
         content = _first_string(data, "content", "markdown", "text")
@@ -94,17 +112,29 @@ class VeniceClient:
                     json=payload,
                     timeout=self.timeout,
                 )
-                if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
-                    _sleep_before_retry(attempt, self.backoff_seconds, response=response)
+                if (
+                    response.status_code in RETRYABLE_STATUS_CODES
+                    and attempt < self.max_retries
+                ):
+                    _sleep_before_retry(
+                        attempt, self.backoff_seconds, response=response
+                    )
                     continue
                 response.raise_for_status()
                 break
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in RETRYABLE_STATUS_CODES and attempt < self.max_retries:
-                    _sleep_before_retry(attempt, self.backoff_seconds, response=exc.response)
+                if (
+                    exc.response.status_code in RETRYABLE_STATUS_CODES
+                    and attempt < self.max_retries
+                ):
+                    _sleep_before_retry(
+                        attempt, self.backoff_seconds, response=exc.response
+                    )
                     continue
                 body = exc.response.text[:1000]
-                raise VeniceError(f"Venice API returned {exc.response.status_code}: {body}") from exc
+                raise VeniceError(
+                    f"Venice API returned {exc.response.status_code}: {body}"
+                ) from exc
             except httpx.HTTPError as exc:
                 if attempt < self.max_retries:
                     _sleep_before_retry(attempt, self.backoff_seconds)
@@ -114,11 +144,57 @@ class VeniceClient:
         try:
             data = response.json()
         except ValueError as exc:
-            raise VeniceError(f"Unexpected Venice API response: {response.text[:1000]}") from exc
+            raise VeniceError(
+                f"Unexpected Venice API response: {response.text[:1000]}"
+            ) from exc
 
         if not isinstance(data, dict):
             raise VeniceError(f"Unexpected Venice API response: {data}")
         return data
+
+    def _post_chat_stream(self, path: str, payload: dict[str, Any]) -> str:
+        for attempt in range(self.max_retries + 1):
+            try:
+                with httpx.stream(
+                    "POST",
+                    f"{self.base_url}{path}",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self.timeout,
+                ) as response:
+                    if (
+                        response.status_code in RETRYABLE_STATUS_CODES
+                        and attempt < self.max_retries
+                    ):
+                        _sleep_before_retry(
+                            attempt, self.backoff_seconds, response=response
+                        )
+                        continue
+                    response.raise_for_status()
+                    return _read_chat_stream(response)
+            except httpx.HTTPStatusError as exc:
+                if (
+                    exc.response.status_code in RETRYABLE_STATUS_CODES
+                    and attempt < self.max_retries
+                ):
+                    _sleep_before_retry(
+                        attempt, self.backoff_seconds, response=exc.response
+                    )
+                    continue
+                body = exc.response.text[:1000]
+                raise VeniceError(
+                    f"Venice API returned {exc.response.status_code}: {body}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                if attempt < self.max_retries:
+                    _sleep_before_retry(attempt, self.backoff_seconds)
+                    continue
+                raise VeniceError(f"Could not reach Venice API: {exc}") from exc
+
+        raise VeniceError("Could not reach Venice API")
 
 
 def _sleep_before_retry(
@@ -135,6 +211,48 @@ def _sleep_before_retry(
             pass
 
     time.sleep(backoff_seconds * (2**attempt))
+
+
+def _read_chat_stream(response: httpx.Response) -> str:
+    parts: list[str] = []
+    for raw_line in response.iter_lines():
+        line = raw_line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            line = line.removeprefix("data:").strip()
+        if line == "[DONE]":
+            break
+
+        try:
+            data = json.loads(line)
+        except ValueError as exc:
+            raise VeniceError(f"Unexpected Venice stream event: {line[:1000]}") from exc
+
+        content = _stream_content(data)
+        if content:
+            parts.append(content)
+
+    if not parts:
+        raise VeniceError("Venice stream ended without content")
+    return "".join(parts)
+
+
+def _stream_content(data: dict[str, Any]) -> str:
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+    for container_name in ("delta", "message"):
+        container = choice.get(container_name)
+        if isinstance(container, dict):
+            content = container.get("content")
+            if isinstance(content, str):
+                return content
+
+    text = choice.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _first_string(data: dict[str, Any], *keys: str) -> str:
