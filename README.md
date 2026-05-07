@@ -1,15 +1,43 @@
 # Venice Research Agent Demo
 
-A minimal Python demo of a deep research agent that uses Venice AI's OpenAI-compatible API for LLM planning, source note-taking, follow-up query generation, and final synthesis.
+A small Python research agent that uses Venice AI to turn a topic into a cited Markdown briefing.
 
-The agent:
+The project is intentionally compact, but it models the main stages of a deep research workflow: query planning, web discovery, source reading, evidence extraction, gap analysis, and final synthesis. Venice does the language-model work through its OpenAI-compatible chat endpoint and reads web pages through its `/augment/scrape` endpoint. The local Python code coordinates the loop, tracks provenance, deduplicates sources, chunks long pages, and writes optional JSONL artifacts so a run can be inspected later.
 
-1. asks Venice to plan diverse search queries for a topic,
-2. searches the web with one or more source providers,
-3. uses Venice's scrape endpoint to turn source pages into Markdown,
-4. chunks the scraped content and asks Venice to extract evidence,
-5. asks Venice for follow-up searches to fill gaps,
-6. writes a cited Markdown research briefing.
+## How the Agent Works
+
+At a high level, `main.py` wires together three pieces:
+
+- `VeniceClient` in `research_agent/venice.py` handles chat completions, streamed report generation, retries, and page scraping through Venice.
+- `WebSearch` in `research_agent/web.py` finds candidate sources through search providers, currently DuckDuckGo and arXiv.
+- `ResearchAgent` in `research_agent/agent.py` runs the research loop and turns collected evidence into a report.
+
+For each topic, the agent follows this flow:
+
+1. **Plan searches**: Venice receives the topic and returns diverse search queries covering background, recent developments, primary sources, criticism, and data.
+2. **Discover sources**: each query runs against the configured providers. DuckDuckGo is the default; arXiv can be added for papers.
+3. **Read pages**: each result is passed to Venice's scrape endpoint, which returns Markdown content plus page metadata.
+4. **Normalize and deduplicate**: URLs are canonicalized, tracking parameters are removed, redirects are checked, and repeated content hashes are skipped.
+5. **Chunk long sources**: scraped Markdown is split into overlapping chunks so useful evidence is not lost when a source is too long for one model call.
+6. **Extract evidence**: Venice summarizes each chunk and returns short supporting quotes when available.
+7. **Create source notes**: chunk evidence is compressed into concise notes with stable source IDs such as `[S1]`.
+8. **Find gaps**: between research passes, Venice reviews the source notes, source balance, and missing coverage, then proposes targeted follow-up queries.
+9. **Write the report**: the final source notes are synthesized into Markdown with footnote-style citations and a numbered `References` section.
+
+The default `deep` report style uses a staged writer: Venice first plans an outline, drafts each body section against relevant source notes, then edits the sections into one coherent report. The `brief` and `standard` styles use a single report prompt with smaller token budgets.
+
+## What Gets Tracked
+
+Each accepted source keeps enough provenance to audit the final report:
+
+- search query, provider, rank, title, snippet, and retrieval time
+- original URL, final redirected URL, and canonical URL
+- content type, content hash, chunk ranges, chunk hashes, chunk summaries, and supporting quotes
+- source-level summary and source ID used during synthesis
+
+When `--artifacts` is set, those records are written as JSONL files, including queries, research gaps, search results, fetch metadata, extracted chunks, chunk summaries, source notes, dedupe decisions, errors, report outlines, report sections, and the final report.
+
+The agent is designed to keep moving when individual searches, fetches, or chunk summaries fail. Web research often hits blocked pages, redirects, duplicate articles, or malformed responses, so failures are recorded as artifacts instead of stopping the whole run.
 
 ## Setup
 
@@ -24,7 +52,7 @@ Add your Venice API key to `.env`:
 
 ```bash
 VENICE_API_KEY=your_venice_api_key_here
-VENICE_MODEL=venice-uncensored
+VENICE_MODEL=openai-gpt-55
 ```
 
 Venice exposes an OpenAI-compatible chat completions endpoint at `https://api.venice.ai/api/v1/chat/completions`. You can change `VENICE_MODEL` to any chat model available to your Venice account.
@@ -67,9 +95,9 @@ uv run python main.py "AI agents in software engineering" --report-style deep
 
 Report styles:
 
-- `brief`: concise briefing with summary, findings, uncertainties, implications, and sources.
-- `standard`: fuller report with method, source landscape, evidence, disagreements, and implications.
-- `deep`: comprehensive report with detailed findings, source quality assessment, open questions, and source-by-source notes.
+- `brief`: concise source-backed briefing with an overview, a few topical sections, and references.
+- `standard`: fuller research survey with context, evidence, disagreements, implications, tables when useful, and a closing synthesis.
+- `deep`: staged long-form report with an outline, section drafts, final editing pass, broader source coverage, and practical takeaways.
 
 Save auditable research artifacts:
 
@@ -94,27 +122,7 @@ If you install the project, the script entry point is also available:
 uv run venice-research "privacy tradeoffs in hosted LLM APIs"
 ```
 
-## How research works
-
-The research process is coordinated by `ResearchAgent` in `research_agent/agent.py`.
-
-1. **Plan initial searches**: Venice receives the topic and returns a JSON list of diverse search queries. The prompt asks for background, recent developments, primary sources, criticism, and data.
-2. **Search providers**: `WebSearch` sends each query to configured providers. The default is DuckDuckGo; `arxiv` can be added for papers with `--providers duckduckgo,arxiv`.
-3. **Deduplicate results**: URLs are canonicalized before reading. Tracking parameters and fragments are removed, redirects are checked after scraping, and duplicate content hashes are skipped.
-4. **Scrape pages with Venice**: for each new result, `VeniceClient.scrape()` calls Venice's `POST /augment/scrape` endpoint with the source URL. Venice returns the page content as Markdown.
-5. **Chunk source text**: scraped Markdown is split into overlapping chunks so long sources are not reduced to a single truncated excerpt.
-6. **Extract chunk evidence**: Venice summarizes each chunk and returns short supporting quotes where useful. These become chunk-level evidence records.
-7. **Summarize each source**: Venice combines the chunk evidence into a concise source note with a source ID like `[S1]`.
-8. **Generate follow-up queries**: after each pass except the last, Venice reviews the current source notes and proposes new searches to fill gaps, verify claims, and find dissenting evidence.
-9. **Write the report**: Venice receives the source notes and writes a Markdown briefing. The report is instructed to cite factual claims with source IDs and include a `Sources` section.
-
-Use `--report-style standard` or `--report-style deep` when you want the final synthesis to spend more tokens on methodology, evidence, uncertainty, and source-by-source analysis.
-
-## Data collection
-
-The collection layer now keeps richer provenance for each source: canonical URL, final redirected URL, search query, provider, rank, snippet, retrieval time, content type, content hash, extracted chunks, chunk summaries, and supporting quotes. Page fetching uses Venice's `/augment/scrape` endpoint, which returns source content as Markdown before chunking.
-
-When `--artifacts` is set, the agent writes JSONL files for queries, search results, fetch metadata, extracted chunks, chunk summaries, source notes, dedupe decisions, errors, and the final report.
+## Source Providers
 
 Available providers:
 
@@ -130,5 +138,5 @@ uv run python -m unittest discover -s tests
 ## Notes
 
 - The web search layer is intentionally lightweight for demo purposes.
-- The model is instructed to cite source IDs like `[S1]` and to avoid uncited factual claims.
+- Source IDs like `[S1]` are internal provenance markers. Final reports are prompted to use footnote-style citations like `[^1]`.
 - The agent continues past individual search or fetch failures because web pages are often blocked, moved, or non-HTML.

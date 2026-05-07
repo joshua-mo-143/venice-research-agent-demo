@@ -16,6 +16,7 @@ class FakeVenice:
         self.outline_prompts: list[str] = []
         self.section_prompts: list[str] = []
         self.editor_prompts: list[str] = []
+        self.gap_prompts: list[str] = []
         self.stream_prompts: list[str] = []
 
     def chat_stream(
@@ -42,6 +43,20 @@ class FakeVenice:
             return json.dumps({"summary": "The chunk contains relevant evidence.", "quotes": ["relevant evidence"]})
         if prompt.startswith("Topic:") and "Synthesize a source note" in prompt:
             return "Source note with relevant evidence [S1]."
+        if "Identify coverage gaps before the next research pass" in prompt:
+            self.gap_prompts.append(prompt)
+            return json.dumps(
+                {
+                    "gaps": [
+                        {
+                            "missing": "Modern agent design patterns",
+                            "why_it_matters": "The report needs concrete architecture coverage.",
+                            "query": "agent research ReAct Reflexion LATS architecture patterns",
+                        }
+                    ],
+                    "queries": ["agent research ReAct Reflexion LATS architecture patterns"],
+                }
+            )
         if "Plan a staged deep research report" in prompt:
             self.outline_prompts.append(prompt)
             return json.dumps(
@@ -152,6 +167,32 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("Final Deep Report", editor_records)
         self.assertEqual(report.sources[0].chunks[0].quotes, ("relevant evidence",))
 
+    def test_follow_up_pass_uses_gap_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            venice = FakeVenice()
+            agent = ResearchAgent(
+                venice=venice,  # type: ignore[arg-type]
+                web=FakeWeb(),  # type: ignore[arg-type]
+                artifacts=ArtifactWriter(Path(tmp)),
+                max_chunks_per_source=1,
+                report_style="standard",
+            )
+
+            agent.run("agent research", iterations=2, query_count=1, results_per_query=1)
+
+            gap_records = (Path(tmp) / "research_gaps.jsonl").read_text(
+                encoding="utf-8"
+            )
+            query_records = (Path(tmp) / "queries.jsonl").read_text(encoding="utf-8")
+
+        self.assertEqual(len(venice.gap_prompts), 1)
+        self.assertIn("Source balance", venice.gap_prompts[0])
+        self.assertIn("overrepresented source domains", venice.gap_prompts[0])
+        self.assertIn("deliberately broaden beyond it", venice.gap_prompts[0])
+        self.assertIn("Modern agent design patterns", gap_records)
+        self.assertIn("source_balance", gap_records)
+        self.assertIn("ReAct Reflexion LATS", query_records)
+
     def test_deep_report_style_uses_staged_report_writer(self) -> None:
         venice = FakeVenice()
         agent = ResearchAgent(
@@ -167,10 +208,15 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(len(venice.stream_prompts), 4)
         self.assertIn("Report style: deep", venice.outline_prompts[-1])
         self.assertIn("concrete synthesis", venice.outline_prompts[-1])
+        self.assertIn("broad, source-backed research survey", venice.outline_prompts[-1])
+        self.assertIn("Do not let one vendor", venice.outline_prompts[-1])
         self.assertIn("Draft one deep report section", venice.section_prompts[-1])
         self.assertIn("decision criteria", venice.section_prompts[-1])
+        self.assertIn("Preserve substantive source-backed coverage", venice.section_prompts[-1])
+        self.assertIn("overrepresents one vendor", venice.section_prompts[-1])
         self.assertIn("Assemble the final deep research report", venice.editor_prompts[-1])
         self.assertIn("Do not compress", venice.editor_prompts[-1])
+        self.assertIn("source base is skewed", venice.editor_prompts[-1])
         self.assertIn("[^1]", venice.editor_prompts[-1])
 
     def test_standard_report_style_still_uses_single_report_prompt(self) -> None:
@@ -189,6 +235,8 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertEqual(venice.editor_prompts, [])
         self.assertEqual(len(venice.stream_prompts), 1)
         self.assertIn("Report style: standard", venice.report_prompts[-1])
+        self.assertIn("source-backed research survey", venice.report_prompts[-1])
+        self.assertIn("Avoid source-cluster capture", venice.report_prompts[-1])
 
     def test_deep_report_falls_back_when_outline_json_is_invalid(self) -> None:
         venice = InvalidOutlineVenice()
@@ -204,7 +252,7 @@ class ResearchAgentTest(unittest.TestCase):
         self.assertIn("Final Deep Report", report.markdown)
         self.assertEqual(len(venice.outline_prompts), 1)
         self.assertGreaterEqual(len(venice.section_prompts), 1)
-        self.assertIn("Core Concepts and Current Landscape", venice.section_prompts[0])
+        self.assertIn("Core Concepts and Historical Context", venice.section_prompts[0])
 
     def test_deep_report_prompt_preserves_late_sources(self) -> None:
         notes = [

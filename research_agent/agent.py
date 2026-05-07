@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from textwrap import dedent
 from typing import Literal
+from urllib.parse import urlparse
 
 from .artifacts import ArtifactWriter
 from .models import (
@@ -28,7 +29,7 @@ ReportStyle = Literal["brief", "standard", "deep"]
 DEFAULT_ITERATIONS = 3
 DEFAULT_QUERY_COUNT = 6
 DEFAULT_RESULTS_PER_QUERY = 4
-DEFAULT_MAX_SOURCES = 25
+DEFAULT_MAX_SOURCES = 40
 DEFAULT_MAX_CHUNKS_PER_SOURCE = 6
 DEFAULT_REPORT_STYLE: ReportStyle = "deep"
 REPORT_TOKEN_BUDGETS: dict[ReportStyle, int] = {
@@ -105,13 +106,25 @@ class ResearchAgent:
             )
 
             if iteration < iterations:
-                queries = self._follow_up_queries(topic, notes, query_count)
+                self.progress("Identifying research gaps for follow-up searches")
+                gaps, queries = self._gap_follow_up_queries(topic, notes, query_count)
+                self.artifacts.write(
+                    "research_gaps",
+                    {
+                        "topic": topic,
+                        "after_iteration": iteration,
+                        "source_balance": _source_cluster_counts(notes),
+                        "gaps": gaps,
+                        "queries": queries,
+                    },
+                )
                 self.artifacts.write(
                     "queries",
                     {
                         "stage": "follow_up",
                         "topic": topic,
                         "iteration": iteration + 1,
+                        "gap_count": len(gaps),
                         "queries": queries,
                     },
                 )
@@ -452,6 +465,7 @@ class ResearchAgent:
         self, topic: str, notes: list[SourceNote], count: int
     ) -> list[str]:
         digest = _source_digest(notes, max_chars=9000)
+        source_balance = _source_balance_digest(notes)
         prompt = dedent(
             f"""
             We are researching: {topic}
@@ -459,12 +473,92 @@ class ResearchAgent:
             Current notes:
             {digest}
 
+            Source balance:
+            {source_balance}
+
             Create {count} follow-up web search queries that fill gaps, verify important claims,
             find primary evidence, and look for dissenting evidence.
+            If one source domain, vendor, framework, product, or perspective is overrepresented,
+            deliberately broaden beyond it unless the topic explicitly asks for that focus.
             Return JSON only in this shape: {{"queries": ["..."]}}
             """
         ).strip()
         return self._query_list(prompt, count, fallback=[topic])
+
+    def _gap_follow_up_queries(
+        self, topic: str, notes: list[SourceNote], count: int
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        if not notes:
+            return [], [topic]
+
+        digest = _source_digest(notes, max_chars=12000)
+        source_balance = _source_balance_digest(notes)
+        prompt = dedent(
+            f"""
+            Identify coverage gaps before the next research pass.
+
+            Research topic:
+            {topic}
+
+            Current source notes:
+            {digest}
+
+            Source balance:
+            {source_balance}
+
+            Find important missing coverage that would improve a deep research report.
+            Look specifically for:
+            - missing technical terms, design patterns, mechanisms, or architecture concepts
+            - missing primary sources, official docs, papers, datasets, benchmarks, or evaluation methods
+            - missing dissenting views, criticisms, failure cases, or limitations
+            - overrepresented source domains, vendors, frameworks, products, or viewpoints where we already have enough evidence
+            - claims that need verification from better sources
+
+            If one source cluster dominates the current notes, generate follow-up queries
+            that deliberately broaden beyond it. Do not include the dominant vendor,
+            framework, product, or source domain in a query unless the research topic
+            explicitly asks for that focus.
+
+            Return JSON only in this shape:
+            {{
+              "gaps": [
+                {{
+                  "missing": "specific missing concept or evidence",
+                  "why_it_matters": "why this gap would improve the report",
+                  "query": "targeted web search query"
+                }}
+              ],
+              "queries": ["targeted web search query"]
+            }}
+
+            Create up to {count} targeted follow-up queries. Prefer precise terms
+            over broad generic searches.
+            """
+        ).strip()
+        response = self.venice.chat(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=900,
+        )
+
+        try:
+            data = _loads_json(response)
+        except json.JSONDecodeError:
+            return [], self._follow_up_queries(topic, notes, count)
+
+        if not isinstance(data, dict):
+            return [], self._follow_up_queries(topic, notes, count)
+
+        gaps = _clean_gap_records(data.get("gaps"))
+        queries = _clean_string_list(data.get("queries"))
+        if not queries:
+            queries = [gap["query"] for gap in gaps if gap.get("query")]
+        if not queries:
+            queries = self._follow_up_queries(topic, notes, count)
+        return gaps, queries[:count]
 
     def _write_report(self, topic: str, notes: list[SourceNote]) -> str:
         if not notes:
@@ -486,9 +580,7 @@ class ResearchAgent:
             max_tokens=REPORT_TOKEN_BUDGETS[self.report_style],
         )
 
-    def _write_staged_deep_report(
-        self, topic: str, notes: list[SourceNote]
-    ) -> str:
+    def _write_staged_deep_report(self, topic: str, notes: list[SourceNote]) -> str:
         self.progress("Planning deep report outline")
         outline = self._create_report_outline(topic, notes)
         self.artifacts.write("report_outline", {"topic": topic, "outline": outline})
@@ -590,9 +682,7 @@ class ResearchAgent:
     ) -> str:
         chat_stream = getattr(self.venice, "chat_stream", None)
         if callable(chat_stream):
-            return chat_stream(
-                messages, temperature=temperature, max_tokens=max_tokens
-            )
+            return chat_stream(messages, temperature=temperature, max_tokens=max_tokens)
         return self.venice.chat(
             messages, temperature=temperature, max_tokens=max_tokens
         )
@@ -679,6 +769,51 @@ def _source_index(notes: list[SourceNote]) -> str:
     )
 
 
+def _source_cluster_counts(notes: list[SourceNote]) -> list[dict[str, object]]:
+    total = len(notes)
+    if total == 0:
+        return []
+
+    clusters: dict[str, list[str]] = {}
+    for note in notes:
+        cluster = _source_cluster(note)
+        clusters.setdefault(cluster, []).append(note.source_id)
+
+    return [
+        {
+            "cluster": cluster,
+            "source_count": len(source_ids),
+            "source_share": round(len(source_ids) / total, 3),
+            "source_ids": source_ids,
+        }
+        for cluster, source_ids in sorted(
+            clusters.items(), key=lambda item: (-len(item[1]), item[0])
+        )
+    ]
+
+
+def _source_balance_digest(notes: list[SourceNote], limit: int = 8) -> str:
+    clusters = _source_cluster_counts(notes)
+    if not clusters:
+        return "No source clusters yet."
+
+    total = len(notes)
+    lines = [
+        f"- {cluster['cluster']}: {cluster['source_count']}/{total} sources "
+        f"({cluster['source_share']:.0%}); IDs: {', '.join(cluster['source_ids'])}"
+        for cluster in clusters[:limit]
+    ]
+    return "\n".join(lines)
+
+
+def _source_cluster(note: SourceNote) -> str:
+    url = note.canonical_url or note.final_url or note.url
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or "unknown"
+
+
 def _notes_for_source_ids(
     notes: list[SourceNote], source_ids: list[str]
 ) -> list[SourceNote]:
@@ -706,12 +841,17 @@ def _report_outline_prompt(topic: str, notes: list[SourceNote]) -> str:
 
         Requirements:
         - Return JSON only.
-        - Plan a useful long-form report, not a compressed answer.
+        - Plan a broad, source-backed research survey with the clarity of a practical briefing.
+        - Preserve meaningful breadth when the sources support it: history or evolution, current landscape, technical concepts, major actors or frameworks, criticisms, datasets or evaluation, and practical implications.
+        - Do not turn the report into a thin decision guide. Decision guidance should come from the survey evidence, not replace it.
+        - Do not let one vendor, framework, product, source domain, or viewpoint dominate the outline unless the topic explicitly asks for that focus or the evidence clearly justifies it.
+        - If one ecosystem appears often in the sources, treat it as one example within the broader landscape and assign sections so alternatives, criticisms, and neutral sources are represented.
         - Choose 5-8 body sections. Do not include Overview, Finishing Up, References, or methodology sections in the section list.
         - Each section must have a distinct synthesis job so section drafts do not overlap.
         - Assign relevant source IDs to each section. Use source IDs exactly as supplied, such as S1.
-        - Identify likely tables where comparison, timelines, frameworks, decision criteria, or tradeoffs would make the report more useful.
-        - Prioritize concrete synthesis: mechanisms, examples, named entities, patterns, tradeoffs, and practical implications.
+        - Identify likely tables where comparison, timelines, frameworks, datasets, benchmarks, decision criteria, or tradeoffs would make the report more useful.
+        - Prioritize concrete synthesis: mechanisms, examples, named entities, patterns, evidence quality, tradeoffs, disagreements, and practical implications.
+        - Prefer topic-specific section headings over generic scaffolding, but keep the report easy to scan.
 
         JSON shape:
         {{
@@ -760,13 +900,15 @@ def _report_section_prompt(
 
         Requirements:
         - Write only this section, starting with the planned "##" heading.
-        - Use a thoughtful long-form technical blog voice: clear, practical, and explanatory.
+        - Use a thoughtful long-form technical survey voice: clear, practical, evidence-led, and explanatory.
         - Develop the section with multiple paragraphs before using bullets or tables.
-        - Make the section useful: explain mechanisms, compare alternatives, name concrete examples, include decision criteria where relevant, and spell out practical implications.
-        - Include a Markdown table if the section plan calls for one or if comparison would make the synthesis clearer.
+        - Preserve substantive source-backed coverage; do not collapse the section into generic advice.
+        - Make the section useful: explain mechanisms, compare alternatives, name concrete examples, include decision criteria where relevant, cover evidence quality or disagreement, and spell out practical implications.
+        - If the section evidence overrepresents one vendor, framework, product, source domain, or viewpoint, avoid treating it as representative of the whole field. Use it as an example and compare or caveat where the evidence allows.
+        - Include a Markdown table if the section plan calls for one or if comparison would make the synthesis clearer. Tables should clarify the survey, not replace the analysis.
         - Use internal source citations like [S1] and [S2] for factual claims. The final editor will convert them to footnote-style citations.
         - Do not write the report overview, Finishing Up, References, or a source-by-source note list.
-        - Aim for 700-1,300 words when the evidence supports it.
+        - Aim for 800-1,400 words when the evidence supports it.
         """
     ).strip()
 
@@ -809,14 +951,19 @@ def _report_editor_prompt(
         Requirements:
         - Produce one coherent Markdown report.
         - Start with the outline title as an H1.
-        - Add a developed "## Overview" before the staged sections. It should synthesize the thesis, explain why the topic matters, and preview the concrete takeaways.
-        - Preserve the useful detail from the section drafts. Do not compress the report into a short summary.
+        - Add a developed "## Overview" before the staged sections. It should synthesize the thesis, explain why the topic matters, give the reader a clear mental model, and preview the concrete takeaways.
+        - Preserve the useful breadth and detail from the section drafts. Do not compress the report into a short summary or thin decision guide.
         - Remove duplicated introductions, repeated claims, and section-to-section seams.
         - Keep or improve useful tables from the drafts.
+        - Make the final report read like a broad research survey organized with practical briefing clarity: substantial coverage first, practical synthesis second.
+        - Do not let one vendor, framework, product, source domain, or viewpoint dominate the final report unless the topic explicitly asks for that focus. If a draft over-focuses on one ecosystem, compress it and compare it against alternatives.
+        - If the available source base is skewed toward one cluster, say so briefly in the relevant section and avoid presenting that cluster as representative of the whole field.
+        - Retain history, current developments, datasets, evaluation, criticisms, or major actors when they materially improve the reader's understanding.
+        - If a section is generic or advice-heavy, ground it in source-backed examples, comparisons, evidence, or limitations.
         - Convert internal source citations like [S1] into Perplexity-like footnote markers like [^1]. Reuse the same marker every time the same source is cited.
         - Do not leave source-ID citations like [S1] in the final report body.
         - Do not include uncited factual claims.
-        - Add "## Finishing Up" before references with practical takeaways and what the reader should do with the findings.
+        - Add "## Finishing Up" before references with practical takeaways that synthesize the report. Avoid a generic recap or unsupported new claims.
         - End with "## References" as a numbered Markdown list ordered by first citation. Each reference must include title, URL, and a short description.
         - Do not include placeholder images.
         """
@@ -868,51 +1015,79 @@ def _normalize_report_outline(
     return {"title": title, "thesis": thesis, "sections": sections}
 
 
-def _fallback_report_outline(
-    topic: str, notes: list[SourceNote]
-) -> dict[str, object]:
+def _fallback_report_outline(topic: str, notes: list[SourceNote]) -> dict[str, object]:
     source_ids = [note.source_id for note in notes]
     return {
         "title": topic.strip().title() if topic.strip() else "Deep Research Report",
         "thesis": (
-            "The report should synthesize the collected source evidence into concrete "
-            "patterns, tradeoffs, examples, and practical takeaways."
+            "The report should synthesize the collected source evidence into a broad "
+            "survey with concrete patterns, tradeoffs, examples, disagreements, and "
+            "practical takeaways."
         ),
         "sections": [
             {
-                "heading": "Core Concepts and Current Landscape",
-                "purpose": "Define the topic and explain the current state using concrete source evidence.",
-                "questions": ["What is this topic, and what has changed recently?"],
+                "heading": "Core Concepts and Historical Context",
+                "purpose": "Define the topic, explain the main concepts, and include only the historical context needed to understand the current landscape.",
+                "questions": [
+                    "What is this topic, where did it come from, and what concepts does a reader need?"
+                ],
                 "source_ids": source_ids,
-                "expected_tables": [],
+                "expected_tables": [
+                    "Timeline or concept map if the evidence supports it"
+                ],
             },
             {
-                "heading": "Major Patterns and Tradeoffs",
-                "purpose": "Compare the main approaches, categories, or design choices in the evidence.",
-                "questions": ["Which patterns matter most, and how do they compare?"],
+                "heading": "Technical Patterns and Architectures",
+                "purpose": "Explain the main approaches, architectures, mechanisms, or design choices in the evidence.",
+                "questions": [
+                    "Which technical patterns matter most, and how do they work?"
+                ],
                 "source_ids": source_ids,
-                "expected_tables": ["Comparison of major patterns, options, or tradeoffs"],
+                "expected_tables": [
+                    "Comparison of major patterns, mechanisms, or architectures"
+                ],
             },
             {
-                "heading": "Concrete Examples and Use Cases",
-                "purpose": "Ground the synthesis in named examples, implementations, or real-world applications.",
-                "questions": ["Where does this show up in practice?"],
+                "heading": "Current Landscape and Major Actors",
+                "purpose": "Ground the synthesis in named examples, implementations, organizations, frameworks, products, or real-world applications.",
+                "questions": [
+                    "Who or what matters in the current landscape, and where does this show up in practice?"
+                ],
                 "source_ids": source_ids,
-                "expected_tables": [],
+                "expected_tables": [
+                    "Comparison of major actors, tools, frameworks, products, or examples"
+                ],
             },
             {
-                "heading": "What This Means in Practice",
-                "purpose": "Translate the research into decision criteria, adoption guidance, and risk considerations.",
+                "heading": "Evidence, Data, and Evaluation",
+                "purpose": "Explain the datasets, benchmarks, metrics, empirical evidence, or source quality that shape the topic.",
+                "questions": [
+                    "What evidence exists, how is progress measured, and where are the evidence gaps?"
+                ],
+                "source_ids": source_ids,
+                "expected_tables": [
+                    "Datasets, benchmarks, metrics, or evidence quality"
+                ],
+            },
+            {
+                "heading": "Criticisms, Tradeoffs, and Open Questions",
+                "purpose": "Explain limitations, risks, unresolved disagreements, tradeoffs, and areas needing further evidence.",
+                "questions": [
+                    "Where is the evidence uncertain, disputed, or practically constrained?"
+                ],
+                "source_ids": source_ids,
+                "expected_tables": [
+                    "Tradeoffs, risks, limitations, or open questions"
+                ],
+            },
+            {
+                "heading": "Practical Implications",
+                "purpose": "Translate the survey into decision criteria, adoption guidance, implementation considerations, and practical takeaways.",
                 "questions": ["What should a reader do with these findings?"],
                 "source_ids": source_ids,
-                "expected_tables": ["Decision criteria and practical implications"],
-            },
-            {
-                "heading": "Limitations and Open Questions",
-                "purpose": "Explain source limitations, unresolved disagreements, and areas needing further evidence.",
-                "questions": ["Where is the evidence uncertain or incomplete?"],
-                "source_ids": source_ids,
-                "expected_tables": [],
+                "expected_tables": [
+                    "Decision criteria and practical implications"
+                ],
             },
         ],
     }
@@ -926,6 +1101,28 @@ def _clean_string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _clean_gap_records(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+
+    gaps: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        missing = _clean_string(item.get("missing"))
+        why_it_matters = _clean_string(item.get("why_it_matters"))
+        query = _clean_string(item.get("query"))
+        if missing or why_it_matters or query:
+            gaps.append(
+                {
+                    "missing": missing,
+                    "why_it_matters": why_it_matters,
+                    "query": query,
+                }
+            )
+    return gaps
 
 
 def _is_boilerplate_report_section(heading: str) -> bool:
@@ -948,27 +1145,29 @@ def _report_prompt(topic: str, notes: list[SourceNote], style: ReportStyle) -> s
     style_instructions = {
         "brief": dedent(
             """
-            Write a concise Perplexity-style research report.
+            Write a concise source-backed research report with practical briefing clarity.
             Layout:
             - Start with a precise H1 title derived from the topic, not "Research report".
             - Open with "## Overview": 1-2 dense paragraphs that directly answer the topic.
             - Add 3-5 topic-specific "##" sections with short, descriptive headings.
-            - Use bullets only for compact lists of components, tradeoffs, or steps.
+            - Preserve meaningful breadth across concepts, current landscape, tradeoffs, evidence, and implications when the source material supports it.
+            - Use bullets only for compact lists of components, tradeoffs, evidence points, or steps.
             - End with "## References".
             """
         ).strip(),
         "standard": dedent(
             """
-            Write a detailed Perplexity-style research report with the readability of a strong technical blog post.
+            Write a detailed source-backed research survey with the readability and organization of a strong technical briefing.
             Layout:
             - Start with a precise H1 title derived from the topic, not "Research report".
             - Open with "## Overview": 3-4 polished paragraphs that set context, explain why the topic matters, and synthesize the answer.
             - Insert "***" between major sections.
             - Use topic-specific "##" sections and occasional "###" subsections rather than generic report scaffolding.
             - Lead each major section with a short narrative paragraph before using bullets or tables.
-            - Include concrete examples, named entities, decision criteria, and tradeoffs wherever the source material supports them.
-            - Include a comparison table when the evidence supports comparing tools, options, categories, timelines, or tradeoffs.
-            - Include a practical "how to think about this" section when the topic involves choices, adoption, implementation, or strategy.
+            - Preserve meaningful breadth across historical context, current landscape, technical concepts, named examples, evidence, criticisms, and practical implications when the source material supports them.
+            - Include concrete examples, named entities, evidence quality, decision criteria, and tradeoffs wherever the source material supports them.
+            - Include a comparison table when the evidence supports comparing tools, options, categories, timelines, datasets, benchmarks, or tradeoffs.
+            - Include a practical "how to think about this" section when the topic involves choices, adoption, implementation, or strategy, but make it an evidence-backed synthesis rather than generic advice.
             - Weave uncertainty and disagreement into the relevant topical section, or add a short "## Limitations and Open Questions" section if needed.
             - Close with "## Finishing Up": 2-3 paragraphs that summarize the practical takeaway without adding new claims.
             - End with "## References".
@@ -976,7 +1175,7 @@ def _report_prompt(topic: str, notes: list[SourceNote], style: ReportStyle) -> s
         ).strip(),
         "deep": dedent(
             """
-            Write a comprehensive Perplexity-style deep research report that reads like a thoughtful long-form technical blog post.
+            Write a comprehensive source-backed research survey that reads like a thoughtful long-form technical briefing.
             Layout:
             - Start with a precise H1 title derived from the topic, not "Research report".
             - Open with "## Overview": 4-6 substantial paragraphs that define the subject, explain why it matters now, state the main conclusion, and preview the most important dimensions.
@@ -984,11 +1183,12 @@ def _report_prompt(topic: str, notes: list[SourceNote], style: ReportStyle) -> s
             - Build the body around topic-specific "##" sections and "###" subsections, as if writing an explanatory reference article.
             - Make the report feel written for an interested human reader: use natural transitions, define terms before leaning on them, and explain why each section matters.
             - Prefer synthesized analysis over source-by-source narration. Do not include default sections named "Executive Summary", "Research Method", "Source Landscape", or "Source-by-Source Notes".
+            - Preserve meaningful breadth across history or evolution, current landscape, technical patterns, major actors, data or datasets, evaluation methods, criticisms, tradeoffs, and practical implications when the source material supports them.
             - Do not over-compress. For important sections, use multiple developed paragraphs before switching to bullets or tables.
-            - Make each major section useful: explain the concrete mechanism, give examples or named cases, compare alternatives, and spell out the practical implication.
-            - Use comparison tables where they clarify patterns, categories, timelines, frameworks, benchmarks, or tradeoffs. A deep report should usually include multiple tables when the source material supports comparison.
+            - Make each major section useful: explain the concrete mechanism, give examples or named cases, compare alternatives, discuss evidence quality or disagreement, and spell out the practical implication.
+            - Use comparison tables where they clarify patterns, categories, timelines, frameworks, benchmarks, datasets, evidence quality, or tradeoffs. A deep report should usually include multiple tables when the source material supports comparison.
             - Use bullets and numbered lists for concrete components, workflows, decision rules, or ranked considerations; keep most analysis in paragraphs.
-            - Include a practical synthesis section, such as "## What This Means in Practice", "## Choosing an Approach", or another topic-specific equivalent.
+            - Include a practical synthesis section, such as "## What This Means in Practice", "## Choosing an Approach", or another topic-specific equivalent, but do not let it replace the survey's substantive coverage.
             - Include decision criteria, adoption guidance, implementation considerations, or risk tradeoffs when the topic has practical consequences.
             - Add a short limitations/open questions section only when the evidence has meaningful gaps, disagreement, or uncertainty.
             - Close with "## Finishing Up": 3-5 paragraphs that bring the argument together, explain what a reader should do with the findings, and avoid introducing unsupported new facts.
@@ -1027,7 +1227,9 @@ def _report_prompt(topic: str, notes: list[SourceNote], style: ReportStyle) -> s
         - Keep citation markers tight to the claim they support, often at the end of the sentence or paragraph.
         - Write in a clear, conversational expert voice. Prefer plain language, useful context, and smooth transitions over terse bullet summaries.
         - Paragraphs should usually be 3-6 sentences. Avoid one-sentence sections unless the section is intentionally short.
-        - Optimize for usefulness and concrete synthesis. Do not merely summarize sources; combine them into takeaways, distinctions, patterns, and tradeoffs.
+        - Optimize for usefulness and concrete synthesis. Do not merely summarize sources; combine them into takeaways, distinctions, patterns, evidence assessments, and tradeoffs.
+        - Keep the breadth of a good research survey while using the structure, tables, and practical clarity of a briefing.
+        - Avoid source-cluster capture: do not let one vendor, framework, product, source domain, or viewpoint dominate unless the topic explicitly asks for that focus. If sources are skewed, acknowledge the skew and compare against alternatives where evidence allows.
         - Avoid generic filler phrases such as "is critical", "is important", or "has significant implications" unless you immediately explain the specific reason.
         - For every major finding, answer at least two of: what changed, why it matters, who it affects, what tradeoff it creates, how it compares to alternatives, or what a reader should do next.
         - Flag uncertainty, source limitations, and contradictions in the relevant section instead of creating boilerplate methodology sections.
